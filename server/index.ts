@@ -1,5 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { db, migrate } from './lib/db.js';
 
 type SessionUser = { id: number; name: string; handle: string };
@@ -45,6 +48,54 @@ migrate(`
   );
   CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id, created_at);
 `);
+
+const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+const distRoot = join(projectRoot, 'dist');
+
+const mimeTypes: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
+
+function serveStatic(pathname: string, res: ServerResponse): boolean {
+  if (!existsSync(distRoot)) return false;
+
+  const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const filePath = normalize(join(distRoot, requested));
+
+  if (!filePath.startsWith(distRoot)) return false;
+
+  if (existsSync(filePath)) {
+    const content = readFileSync(filePath);
+    res.writeHead(200, {
+      'Content-Type': mimeTypes[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
+      'Cache-Control': extname(filePath) === '.html' ? 'no-cache' : 'public, max-age=31536000, immutable',
+    });
+    res.end(content);
+    return true;
+  }
+
+  // Vite/React client-side routes should fall back to index.html.
+  const indexPath = join(distRoot, 'index.html');
+  if (existsSync(indexPath)) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+    res.end(readFileSync(indexPath));
+    return true;
+  }
+
+  return false;
+}
 
 function json(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -117,6 +168,11 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const path = url.pathname;
   try {
     if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true });
+
+    // Serve the Vite-built React app for normal browser requests.
+    if (req.method === 'GET' && !path.startsWith('/api/')) {
+      if (serveStatic(path, res)) return;
+    }
 
     if (req.method === 'POST' && path === '/api/auth/register') {
       const body = await readBody(req);
